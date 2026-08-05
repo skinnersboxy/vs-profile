@@ -1,0 +1,345 @@
+#!/bin/bash
+# vs-profile — isolated mod/save profiles for Vintage Story
+#
+# Each profile is a full data directory (its own Mods, Saves, ModConfig,
+# keybinds), so mod sets for different servers never collide.
+#
+# Profiles live in ~/.config/VintagestoryData-<name>.
+# Game installs are expected at ~/games/vintagestory-<version>.
+
+set -euo pipefail
+
+GAMES_DIR="${VS_PROFILE_GAMES_DIR:-$HOME/games}"
+DEFAULT_VERSION="${VS_PROFILE_DEFAULT_VERSION:-}"
+SYNC_WAIT_SECS="${VS_PROFILE_SYNC_WAIT:-180}"
+
+profile_dir() { echo "$HOME/.config/VintagestoryData-$1"; }
+die() { echo "vs-profile: $*" >&2; exit 1; }
+
+usage() {
+    cat <<'EOF'
+vs-profile — isolated mod/save profiles for Vintage Story
+
+  vs-profile <name> [game args...]  launch a profile, creating it if new
+  vs-profile list                   profiles with mod/save counts and sync state
+  vs-profile mods <name>            list a profile's mods
+  vs-profile path <name>            print a profile's data directory
+  vs-profile pin <name> <ver>       always launch this profile on game <ver>
+  vs-profile unpin <name>           go back to the newest installed version
+  vs-profile sync <name>            move a profile into your cloud folder
+  vs-profile unsync <name>          move it back to local disk
+
+Options
+  -g, --game-version <ver>  launch a specific game version (overrides a pin)
+  -f, --force               launch even if another machine holds the sync lock
+  -h, --help                this help
+
+Environment
+  VS_PROFILE_SYNC_DIR    cloud folder to sync into (default: auto-detect Dropbox)
+  VS_PROFILE_GAMES_DIR   where game installs live (default: ~/games)
+  VS_PROFILE_SYNC_WAIT   seconds to wait for sync before launching (default: 180)
+EOF
+}
+
+# ---------------------------------------------------------------- versions ---
+
+list_versions() {
+    for d in "$GAMES_DIR"/vintagestory-*/; do
+        [ -d "$d" ] || continue
+        basename "$d" | sed 's/^vintagestory-//'
+    done | sort -V
+}
+
+newest_version() { list_versions | tail -1; }
+
+have_version() { [ -x "$GAMES_DIR/vintagestory-$1/Vintagestory" ]; }
+
+# A pinned version lives in the profile, not in this script's config, so it
+# travels with a synced profile and survives a reinstall. Servers pin their
+# game version and reject mismatched clients, so "newest installed" is the
+# wrong default for a server profile — and can even be an older release than
+# the newest one you have.
+pin_file() { echo "$(readlink -f "$(profile_dir "$1")")/.vs-profile-gameversion"; }
+
+read_pin() {
+    local f
+    f=$(pin_file "$1")
+    [ -f "$f" ] || return 0
+    head -1 "$f" | tr -d '[:space:]'
+}
+
+cmd_pin() {
+    local name="$1" version="$2"
+    [ -d "$(profile_dir "$name")" ] || die "no such profile: $name"
+    have_version "$version" || \
+        die "game version $version not installed (have: $(list_versions | tr '\n' ' '))"
+    echo "$version" > "$(pin_file "$name")"
+    echo "vs-profile: '$name' pinned to game $version"
+}
+
+cmd_unpin() {
+    local name="$1" f
+    [ -d "$(profile_dir "$name")" ] || die "no such profile: $name"
+    f=$(pin_file "$name")
+    [ -f "$f" ] || die "profile '$name' is not pinned"
+    rm "$f"
+    echo "vs-profile: '$name' unpinned; will use the newest installed version"
+}
+
+# -------------------------------------------------------------------- sync ---
+
+# Root of the local cloud folder, or empty if none found.
+sync_root() {
+    if [ -n "${VS_PROFILE_SYNC_DIR:-}" ]; then echo "$VS_PROFILE_SYNC_DIR"; return; fi
+    if [ -f "$HOME/.dropbox/info.json" ]; then
+        local p
+        p=$(python3 -c "
+import json
+try:
+    d=json.load(open('$HOME/.dropbox/info.json'))
+    for k in ('personal','business'):
+        if k in d and d[k].get('path'):
+            print(d[k]['path']); break
+except Exception: pass
+" 2>/dev/null || true)
+        [ -n "$p" ] && { echo "$p"; return; }
+    fi
+    [ -d "$HOME/Dropbox" ] && echo "$HOME/Dropbox"
+    return 0
+}
+
+is_synced() { [ -L "$(profile_dir "$1")" ]; }
+
+# Block until the cloud client reports idle, so we never open a save mid-download.
+wait_for_sync() {
+    command -v dropbox >/dev/null 2>&1 || return 0
+    local status waited=0
+    status=$(dropbox status 2>/dev/null | head -1 || true)
+    case "$status" in
+        "Up to date"|"") return 0 ;;
+        *"isn't running"*|*"not running"*)
+            echo "vs-profile: warning — Dropbox is not running; the profile may be stale" >&2
+            return 0 ;;
+    esac
+    echo "vs-profile: waiting for Dropbox to finish syncing ($status)"
+    while [ "$waited" -lt "$SYNC_WAIT_SECS" ]; do
+        sleep 2; waited=$((waited+2))
+        status=$(dropbox status 2>/dev/null | head -1 || true)
+        [ "$status" = "Up to date" ] && { echo "vs-profile: sync complete"; return 0; }
+    done
+    echo "vs-profile: warning — still syncing after ${SYNC_WAIT_SECS}s, launching anyway" >&2
+}
+
+# A synced profile opened on two machines at once corrupts the save database.
+LOCK=""
+claim_lock() {
+    local data="$1" force="$2" host
+    LOCK="$data/.vs-profile-lock"
+    if [ -f "$LOCK" ]; then
+        host=$(head -1 "$LOCK" 2>/dev/null || true)
+        if [ -n "$host" ] && [ "$host" != "$(hostname)" ]; then
+            if [ "$force" != "yes" ]; then
+                echo "vs-profile: profile is locked by '$host'." >&2
+                echo "  Running it on two machines at once will corrupt the save." >&2
+                echo "  If that machine is closed, clear it with: rm '$LOCK'" >&2
+                echo "  Or override with: vs-profile -f <name>" >&2
+                exit 1
+            fi
+            echo "vs-profile: overriding lock held by '$host'" >&2
+        fi
+    fi
+    { hostname; date -u +%Y-%m-%dT%H:%M:%SZ; } > "$LOCK"
+    trap 'rm -f "$LOCK"' EXIT INT TERM
+}
+
+cmd_sync() {
+    local name="$1" root src dst
+    src=$(profile_dir "$name")
+    [ -d "$src" ] || die "no such profile: $name"
+    is_synced "$name" && die "profile '$name' is already synced (-> $(readlink "$src"))"
+    root=$(sync_root)
+    [ -n "$root" ] || die "no cloud folder found; set VS_PROFILE_SYNC_DIR"
+    [ -d "$root" ] || die "cloud folder does not exist: $root"
+    dst="$root/VintageStory/$name"
+    [ -e "$dst" ] && die "destination already exists: $dst"
+    mkdir -p "$root/VintageStory"
+    echo "vs-profile: moving $src -> $dst"
+    mv "$src" "$dst"
+    ln -s "$dst" "$src"
+    echo "vs-profile: '$name' now syncs via $dst"
+    echo
+    echo "  Do NOT exclude Logs/Cache/Backups from selective sync — the game"
+    echo "  recreates them each launch and the sync client will fight it."
+    echo "  Do NOT run this profile on two machines at once; saves are databases."
+}
+
+cmd_unsync() {
+    local name="$1" src target
+    src=$(profile_dir "$name")
+    is_synced "$name" || die "profile '$name' is not synced"
+    target=$(readlink -f "$src")
+    rm "$src"
+    echo "vs-profile: moving $target -> $src"
+    mv "$target" "$src"
+    echo "vs-profile: '$name' is now local only"
+}
+
+# ----------------------------------------------------------------- listing ---
+
+count_glob() { local n=0 f; for f in "$@"; do [ -e "$f" ] && n=$((n+1)); done; echo "$n"; }
+
+print_row() {
+    local d="$1" label="$2" sync="$3" pinned="$4"
+    printf '%-16s %-6s %-6s %-7s %-8s %s\n' "$label" \
+        "$(count_glob "$d"/Mods/*.zip "$d"/Mods/*.cs "$d"/Mods/*.dll)" \
+        "$(count_glob "$d"/Saves/*.vcdbs)" "$sync" "${pinned:--}" "$d"
+}
+
+cmd_list() {
+    local d name root
+    printf '%-16s %-6s %-6s %-7s %-8s %s\n' PROFILE MODS SAVES SYNCED PINNED PATH
+    for d in "$HOME"/.config/VintagestoryData-*/; do
+        [ -d "$d" ] || continue
+        name=$(basename "${d%/}" | sed 's/^VintagestoryData-//')
+        if is_synced "$name"; then
+            print_row "$(readlink -f "${d%/}")" "$name" "yes" "$(read_pin "$name")"
+        else
+            print_row "${d%/}" "$name" "no" "$(read_pin "$name")"
+        fi
+    done
+    echo
+    echo "Installed versions: $(list_versions | tr '\n' ' ')"
+    root=$(sync_root)
+    [ -n "$root" ] && echo "Cloud folder: $root"
+    return 0
+}
+
+# --------------------------------------------------------------- launching ---
+
+# Vintage Story reads mod folders from "modPaths" in clientsettings.json, NOT
+# from --dataPath. A settings file copied from another profile carries that
+# profile's absolute Mods path and silently wins, so pin it on every launch.
+repair_mod_paths() {
+    python3 - "$1" <<'PY' || true
+import json, os, sys
+prof = sys.argv[1]
+cs = os.path.join(prof, 'clientsettings.json')
+if not os.path.isfile(cs): sys.exit(0)
+try:
+    with open(cs) as f: d = json.load(f)
+except Exception: sys.exit(0)
+sl = d.get('stringListSettings')
+if not isinstance(sl, dict): sys.exit(0)
+want = ['Mods', os.path.join(os.path.realpath(prof), 'Mods')]
+if sl.get('modPaths') != want:
+    sl['modPaths'] = want
+    tmp = cs + '.tmp'
+    with open(tmp, 'w') as f: json.dump(d, f, indent=1)
+    os.replace(tmp, cs)
+    print(f"vs-profile: repaired modPaths -> {want[1]}")
+PY
+}
+
+# -------------------------------------------------------------------- main ---
+
+FORCE=no
+VERSION_ARG=""
+while [ $# -gt 0 ]; do
+    case "$1" in
+        -g|--game-version) VERSION_ARG="${2:-}"; shift 2 ;;
+        -f|--force)        FORCE=yes; shift ;;
+        -h|--help)         usage; exit 0 ;;
+        --)                shift; break ;;
+        *)                 break ;;
+    esac
+done
+
+[ $# -ge 1 ] || { usage; exit 1; }
+
+case "$1" in
+    list|ls) cmd_list; exit 0 ;;
+    path)    [ $# -ge 2 ] || die "usage: vs-profile path <name>"
+             profile_dir "$2"; exit 0 ;;
+    mods)    [ $# -ge 2 ] || die "usage: vs-profile mods <name>"
+             DIR=$(readlink -f "$(profile_dir "$2")")
+             [ -d "$DIR" ] || die "no such profile: $2"
+             ls -1 "$DIR/Mods" 2>/dev/null || echo "(no mods)"
+             exit 0 ;;
+    pin)     [ $# -ge 3 ] || die "usage: vs-profile pin <name> <game-version>"
+             cmd_pin "$2" "$3"; exit 0 ;;
+    unpin)   [ $# -ge 2 ] || die "usage: vs-profile unpin <name>"
+             cmd_unpin "$2"; exit 0 ;;
+    sync)    [ $# -ge 2 ] || die "usage: vs-profile sync <name>"
+             cmd_sync "$2"; exit 0 ;;
+    unsync)  [ $# -ge 2 ] || die "usage: vs-profile unsync <name>"
+             cmd_unsync "$2"; exit 0 ;;
+esac
+
+NAME="$1"; shift
+case "$NAME" in */*|.|..) die "invalid profile name: $NAME" ;; esac
+
+DATA=$(profile_dir "$NAME")
+if [ ! -e "$DATA" ]; then
+    echo "vs-profile: creating new profile '$NAME' at $DATA"
+    mkdir -p "$DATA/Mods"
+    # Seed keybinds/graphics from an existing profile so new ones aren't bare.
+    # repair_mod_paths below undoes the mod path this drags along.
+    for seed in "$HOME"/.config/VintagestoryData-*/ "$HOME/.config/VintagestoryData"; do
+        [ -f "$seed/clientsettings.json" ] || continue
+        [ "$(readlink -f "$seed")" = "$(readlink -f "$DATA")" ] && continue
+        cp "$seed/clientsettings.json" "$DATA/clientsettings.json"; break
+    done
+    echo "vs-profile: drop mod .zip files into $DATA/Mods"
+fi
+mkdir -p "$DATA/Mods"
+
+# -g wins, then the profile's own pin, then the newest install.
+PIN=$(read_pin "$NAME")
+VERSION="${VERSION_ARG:-${PIN:-${DEFAULT_VERSION:-$(newest_version)}}}"
+[ -n "$VERSION" ] || die "no game installs found in $GAMES_DIR"
+if ! have_version "$VERSION"; then
+    if [ -n "$PIN" ] && [ "$VERSION" = "$PIN" ]; then
+        die "'$NAME' is pinned to game $PIN, which is not installed in $GAMES_DIR
+  (have: $(list_versions | tr '\n' ' '))
+  Install it, or override with: vs-profile -g <ver> $NAME
+  Or drop the pin with: vs-profile unpin $NAME"
+    fi
+    die "game version $VERSION not found at $GAMES_DIR/vintagestory-$VERSION (have: $(list_versions | tr '\n' ' '))"
+fi
+GAME="$GAMES_DIR/vintagestory-$VERSION"
+if [ -n "$PIN" ]; then
+    if [ "$VERSION" = "$PIN" ]; then
+        echo "vs-profile: '$NAME' is pinned to game $VERSION"
+    else
+        echo "vs-profile: using game $VERSION, overriding the $PIN pin on '$NAME'"
+    fi
+fi
+
+if is_synced "$NAME"; then
+    wait_for_sync
+    claim_lock "$(readlink -f "$DATA")" "$FORCE"
+fi
+
+repair_mod_paths "$DATA"
+
+# 1.22+ needs the .NET 10 runtime at ~/.dotnet; 1.21 and older use system .NET
+case "$VERSION" in
+    1.21.*|1.20.*|1.19.*) ;;
+    *) if [ -d "$HOME/.dotnet" ]; then
+           export DOTNET_ROOT="$HOME/.dotnet"
+           export PATH="$DOTNET_ROOT:$PATH"
+       fi ;;
+esac
+
+export FONTCONFIG_FILE="$GAME/fonts.conf"
+cd "$GAME"
+./Vintagestory --dataPath="$DATA" "$@"
+
+# Give the cloud client a moment to push the save before we exit, so
+# "quit game, close laptop" doesn't strand an unsynced world.
+if is_synced "$NAME" && command -v dropbox >/dev/null 2>&1; then
+    rm -f "$LOCK"; LOCK=""
+    trap - EXIT INT TERM
+    echo "vs-profile: waiting for Dropbox to upload the save..."
+    wait_for_sync
+fi
