@@ -28,16 +28,22 @@ vs-profile — isolated mod/save profiles for Vintage Story
   vs-profile unpin <name>           go back to the newest installed version
   vs-profile sync <name>            move a profile into your cloud folder
   vs-profile unsync <name>          move it back to local disk
+  vs-profile update <name>          update its mods from ModDB; check for a new game
+  vs-profile install [<ver>]        install a game version from the CDN
 
 Options
   -g, --game-version <ver>  launch a specific game version (overrides a pin)
   -f, --force               launch even if another machine holds the sync lock
+  -n, --dry-run             update: report what would change, download nothing
+      --game                update: also install a new game version if one is out
   -h, --help                this help
 
 Environment
   VS_PROFILE_SYNC_DIR    cloud folder to sync into (default: auto-detect Dropbox)
   VS_PROFILE_GAMES_DIR   where game installs live (default: ~/games)
   VS_PROFILE_SYNC_WAIT   seconds to wait for sync before launching (default: 180)
+  VS_PROFILE_STABLE_API  game release index (default: api.vintagestory.at)
+  VS_PROFILE_MODDB_API   mod database API (default: mods.vintagestory.at/api)
 EOF
 }
 
@@ -240,6 +246,309 @@ if sl.get('modPaths') != want:
 PY
 }
 
+# ----------------------------------------------------------------- updating ---
+
+STABLE_API="${VS_PROFILE_STABLE_API:-https://api.vintagestory.at/stable.json}"
+MODDB_API="${VS_PROFILE_MODDB_API:-https://mods.vintagestory.at/api}"
+
+# "<version> <url> <md5>" for one release, or for the newest stable one.
+stable_info() {
+    python3 - "$STABLE_API" "${1:-}" <<'PY'
+import json, re, sys, urllib.request
+api, want = sys.argv[1], sys.argv[2]
+req = urllib.request.Request(api, headers={'User-Agent': 'vs-profile'})
+try:
+    with urllib.request.urlopen(req, timeout=30) as r:
+        data = json.load(r)
+except Exception as e:
+    sys.exit(f"cannot reach {api}: {e}")
+best = None
+for ver, platforms in data.items():
+    if not re.fullmatch(r'\d+\.\d+\.\d+', ver):
+        continue
+    if want and ver != want:
+        continue
+    linux = platforms.get('linux') or {}
+    urls = linux.get('urls') or {}
+    url = urls.get('cdn') or urls.get('local')
+    if not url:
+        continue
+    key = [int(x) for x in ver.split('.')]
+    if best is None or key > best[0]:
+        best = (key, ver, url, linux.get('md5') or '-')
+if best is None:
+    sys.exit(f"no linux build for {want}" if want else "no stable release listed")
+print(best[1], best[2], best[3])
+PY
+}
+
+# 1.22+ needs the .NET 10 runtime at ~/.dotnet; the shipped run.sh uses whatever
+# dotnet is on PATH, which on most distros is an older one that just fails.
+add_dotnet_export() {
+    local dir="$1" version="$2" f
+    case "$version" in 1.21.*|1.20.*|1.19.*) return 0 ;; esac
+    [ -d "$HOME/.dotnet" ] || return 0
+    for f in "$dir/run.sh" "$dir/server.sh"; do
+        [ -f "$f" ] || continue
+        if grep -q DOTNET_ROOT "$f"; then continue; fi
+        python3 - "$f" "$version" <<'PY'
+import sys
+path, version = sys.argv[1], sys.argv[2]
+lines = open(path).read().splitlines(True)
+at = 1 if lines and lines[0].startswith('#!') else 0
+lines[at:at] = [f'\n# {version} needs the .NET 10 runtime (the system one is often older)\n',
+                'export DOTNET_ROOT="$HOME/.dotnet"\n',
+                'export PATH="$DOTNET_ROOT:$PATH"\n']
+open(path, 'w').write(''.join(lines))
+PY
+    done
+    return 0
+}
+
+# The client tarball unpacks into a nested vintagestory/ directory, so it cannot
+# just be extracted into place — flatten it into a versioned install dir.
+cmd_install() {
+    local want="${1:-}" info version url md5 dest tmp got src
+    info=$(stable_info "$want") || exit 1
+    read -r version url md5 <<<"$info"
+    dest="$GAMES_DIR/vintagestory-$version"
+    if [ -e "$dest" ]; then
+        echo "vs-profile: game $version is already installed at $dest"
+        return 0
+    fi
+    mkdir -p "$GAMES_DIR"
+    # Unpack next to the installs so the final move is a rename, not a 2GB copy.
+    tmp=$(mktemp -d "$GAMES_DIR/.vs-profile-install.XXXXXX")
+    echo "vs-profile: downloading game $version"
+    if ! curl -fL --progress-bar -o "$tmp/client.tar.gz" "$url"; then
+        rm -rf "$tmp"; die "download failed: $url"
+    fi
+    if [ "$md5" != "-" ] && command -v md5sum >/dev/null 2>&1; then
+        got=$(md5sum "$tmp/client.tar.gz" | cut -d' ' -f1)
+        if [ "$got" != "$md5" ]; then
+            rm -rf "$tmp"; die "checksum mismatch for $version (got $got, expected $md5)"
+        fi
+    fi
+    mkdir -p "$tmp/unpack"
+    if ! tar xzf "$tmp/client.tar.gz" -C "$tmp/unpack"; then
+        rm -rf "$tmp"; die "could not unpack the $version tarball"
+    fi
+    src="$tmp/unpack/vintagestory"
+    [ -d "$src" ] || src="$tmp/unpack"
+    if [ ! -f "$src/Vintagestory" ]; then
+        rm -rf "$tmp"; die "unexpected tarball layout: no Vintagestory binary in $src"
+    fi
+    mv "$src" "$dest"
+    rm -rf "$tmp"
+    chmod +x "$dest/Vintagestory" "$dest/VintagestoryServer" \
+             "$dest/run.sh" "$dest/server.sh" 2>/dev/null || true
+    add_dotnet_export "$dest" "$version"
+    echo "vs-profile: installed game $version at $dest"
+    # Some setups keep a ~/games/vintagestory symlink on the newest install;
+    # follow it along, but never create one that was not already there.
+    if [ -L "$GAMES_DIR/vintagestory" ] && [ "$version" = "$(newest_version)" ]; then
+        ln -sfn "vintagestory-$version" "$GAMES_DIR/vintagestory"
+        echo "vs-profile: $GAMES_DIR/vintagestory -> vintagestory-$version"
+    fi
+    return 0
+}
+
+# Mods are matched to the game version the profile actually launches on, which
+# is the pin if it has one — a server profile must not be dragged forward.
+update_mods() {
+    python3 - "$1" "$2" "$3" "$MODDB_API" <<'PY'
+import json, os, re, sys, tempfile, urllib.request, zipfile
+
+data, target, dry, api = sys.argv[1], sys.argv[2], sys.argv[3] == 'yes', sys.argv[4]
+mods_dir = os.path.join(data, 'Mods')
+backup_dir = os.path.join(data, '.vs-profile-oldmods')
+UA = {'User-Agent': 'vs-profile'}
+
+def get(url, binary=False):
+    req = urllib.request.Request(url, headers=UA)
+    with urllib.request.urlopen(req, timeout=60) as r:
+        return r.read() if binary else json.load(r)
+
+# modinfo.json is hand-written and routinely has comments, trailing commas or
+# stray control characters in it, so a plain json.loads is not enough.
+def read_modinfo(path):
+    try:
+        with zipfile.ZipFile(path) as z:
+            names = [n for n in z.namelist()
+                     if n.lower() == 'modinfo.json' or n.lower().endswith('/modinfo.json')]
+            if not names:
+                return None
+            raw = z.read(sorted(names, key=len)[0]).decode('utf-8-sig', 'replace')
+    except Exception:
+        return None
+    txt = re.sub(r'(?m)//[^\n"]*$', '', raw)
+    txt = re.sub(r',(\s*[}\]])', r'\1', txt)
+    txt = ''.join(c for c in txt if c >= ' ' or c in '\t\n\r')
+    try:
+        return {k.lower(): v for k, v in json.loads(txt).items()}
+    except Exception:
+        return None
+
+def vkey(v):
+    s = str(v).lstrip('vV')
+    nums = [int(n) for n in re.findall(r'\d+', s.split('-')[0])]
+    return (nums, 0 if '-' in s else 1, s)   # 1.2.0-rc.1 sorts below 1.2.0
+
+def branch(v):
+    return tuple(re.findall(r'\d+', v)[:2])
+
+tb = branch(target)
+zips = sorted(f for f in os.listdir(mods_dir) if f.lower().endswith('.zip')) \
+       if os.path.isdir(mods_dir) else []
+loose = sorted(f for f in os.listdir(mods_dir)
+               if f.lower().endswith(('.cs', '.dll'))) if os.path.isdir(mods_dir) else []
+
+plan, current, notes = [], 0, []
+for name in zips:
+    path = os.path.join(mods_dir, name)
+    info = read_modinfo(path)
+    if not info or not info.get('modid') or not info.get('version'):
+        notes.append(f"{name}: no readable modinfo.json, skipped")
+        continue
+    modid, cur = str(info['modid']), str(info['version'])
+    try:
+        mod = (get(f"{api}/mod/{modid}") or {}).get('mod')
+    except Exception as e:
+        notes.append(f"{modid}: ModDB lookup failed ({e})")
+        continue
+    if not mod:
+        notes.append(f"{modid}: not found on ModDB, skipped")
+        continue
+    releases = [r for r in mod.get('releases', []) if r.get('modversion') and r.get('mainfile')]
+    exact = [r for r in releases if target in (r.get('tags') or [])]
+    # Authors often stop re-tagging a working mod, so a release tagged for an
+    # earlier 1.22.x is still the right pick on 1.22.7 — flag it, do not skip it.
+    same = [r for r in releases
+            if any('-' not in t and branch(t) == tb for t in (r.get('tags') or []))]
+    pool = exact or same
+    if not pool:
+        notes.append(f"{modid} {cur}: no release tagged for game {'.'.join(tb)}.x")
+        continue
+    # An rc is not an upgrade for someone who is on a stable release, so it is
+    # only offered when the mod has nothing stable to offer at all.
+    stable = [r for r in pool if '-' not in str(r['modversion'])]
+    best = max(stable or pool, key=lambda r: vkey(r['modversion']))
+    if vkey(best['modversion']) <= vkey(cur):
+        current += 1
+        continue
+    # Say which way the tag misses: a release that stopped being re-tagged is a
+    # different risk from one built against a patch newer than this profile runs.
+    lag = ''
+    if not exact:
+        top = max([t for t in (best.get('tags') or []) if '-' not in t and branch(t) == tb],
+                  key=vkey)
+        lag = (f"  (tagged up to {top}, you run {target})" if vkey(top) < vkey(target)
+               else f"  (tagged for {top}, newer than {target})")
+    if not stable:
+        lag += '  (prerelease)'
+    plan.append({'modid': modid, 'file': name, 'from': cur, 'to': best['modversion'],
+                 'url': best['mainfile'],
+                 'newfile': best.get('filename') or f"{modid}_{best['modversion']}.zip",
+                 'lag': lag})
+
+for n in notes:
+    print(f"  note: {n}")
+for m in loose:
+    print(f"  note: {m}: loose .cs/.dll mod, not tracked on ModDB")
+
+skipped = len(notes) + len(loose)
+tail = f", {skipped} skipped" if skipped else ""
+if not plan:
+    print(f"mods:  {current} up to date for game {target}{tail}")
+    sys.exit(0)
+
+print(f"mods:  {len(plan)} update(s) for game {target}, {current} already current{tail}")
+for p in plan:
+    print(f"       {p['modid']}  {p['from']} -> {p['to']}{p['lag']}")
+if dry:
+    print("       (dry run, nothing downloaded)")
+    sys.exit(0)
+
+os.makedirs(backup_dir, exist_ok=True)
+failed = 0
+for p in plan:
+    try:
+        blob = get(p['url'], binary=True)
+    except Exception as e:
+        print(f"       {p['modid']}: download failed ({e})"); failed += 1; continue
+    fd, tmp = tempfile.mkstemp(dir=mods_dir, suffix='.part')
+    with os.fdopen(fd, 'wb') as f:
+        f.write(blob)
+    got = read_modinfo(tmp)
+    # A ModDB mainfile can redirect to an HTML error page; only a zip whose
+    # modinfo matches what we asked for is allowed to replace a working mod.
+    if not got or str(got.get('modid', '')).lower() != p['modid'].lower():
+        os.unlink(tmp)
+        print(f"       {p['modid']}: downloaded file is not that mod, skipped"); failed += 1
+        continue
+    # Keep one generation of backups so a synced profile does not accumulate
+    # every zip it has ever had.
+    for old in os.listdir(backup_dir):
+        if old.startswith(p['modid'] + '__'):
+            os.unlink(os.path.join(backup_dir, old))
+    os.replace(os.path.join(mods_dir, p['file']),
+               os.path.join(backup_dir, f"{p['modid']}__{p['file']}"))
+    os.replace(tmp, os.path.join(mods_dir, p['newfile']))
+    os.chmod(os.path.join(mods_dir, p['newfile']), 0o644)
+    print(f"       {p['modid']} -> {p['to']}  ({p['newfile']})")
+
+print(f"       previous versions kept in {backup_dir}")
+sys.exit(1 if failed else 0)
+PY
+}
+
+cmd_update() {
+    local name="" dry=no want_game=no data pin target info latest url md5
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            -n|--dry-run) dry=yes; shift ;;
+            --game)       want_game=yes; shift ;;
+            -*)           die "unknown option for update: $1" ;;
+            *)            [ -z "$name" ] || die "usage: vs-profile update <name> [--dry-run] [--game]"
+                          name="$1"; shift ;;
+        esac
+    done
+    [ -n "$name" ] || die "usage: vs-profile update <name> [--dry-run] [--game]"
+    data=$(readlink -f "$(profile_dir "$name")")
+    [ -d "$data" ] || die "no such profile: $name"
+    if command -v pgrep >/dev/null 2>&1 && pgrep -f "dataPath=$data" >/dev/null 2>&1; then
+        die "the game is running on '$name'; quit it before updating its mods"
+    fi
+    pin=$(read_pin "$name")
+
+    # The game first: on an unpinned profile a fresh install moves the target
+    # the mods have to match, so it has to be settled before they are picked.
+    if info=$(stable_info); then
+        read -r latest url md5 <<<"$info"
+        if have_version "$latest"; then
+            echo "game:  $latest is the newest stable release and is installed"
+        elif [ "$want_game" = yes ] && [ "$dry" = no ]; then
+            cmd_install "$latest"
+        else
+            echo "game:  $latest is available (installed: $(list_versions | tr '\n' ' '))"
+            echo "       'vs-profile update $name --game' downloads and installs it"
+        fi
+    else
+        echo "game:  version check failed; carrying on with the mods" >&2
+    fi
+
+    target="${VERSION_ARG:-${pin:-$(newest_version)}}"
+    [ -n "$target" ] || die "no game installs found in $GAMES_DIR"
+    have_version "$target" || die "game version $target is not installed in $GAMES_DIR"
+    # A pinned profile is usually a server profile, and a server checks the mod
+    # list it is handed — updating one half of that pair locks you out.
+    if [ -n "$pin" ]; then
+        echo "       '$name' is pinned to $pin, so its mods are matched to that;"
+        echo "       if it is a server profile, update only when the server does"
+    fi
+    update_mods "$data" "$target" "$dry"
+}
+
 # -------------------------------------------------------------------- main ---
 
 FORCE=no
@@ -273,6 +582,8 @@ case "$1" in
              cmd_sync "$2"; exit 0 ;;
     unsync)  [ $# -ge 2 ] || die "usage: vs-profile unsync <name>"
              cmd_unsync "$2"; exit 0 ;;
+    update)  shift; cmd_update "$@"; exit $? ;;
+    install) cmd_install "${2:-}"; exit 0 ;;
 esac
 
 NAME="$1"; shift

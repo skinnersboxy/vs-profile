@@ -45,9 +45,13 @@ vs-profile pin <name> <ver>        always launch this profile on game <ver>
 vs-profile unpin <name>            go back to the newest installed version
 vs-profile sync <name>             move a profile into your cloud folder
 vs-profile unsync <name>           move it back to local disk
+vs-profile update <name>           update its mods from ModDB; check for a new game
+vs-profile install [<ver>]         install a game version from the CDN
 
   -g, --game-version <ver>   launch a specific game version (overrides a pin)
   -f, --force                launch despite another machine's sync lock
+  -n, --dry-run              update: report what would change, download nothing
+      --game                 update: also install a new game version if one is out
 ```
 
 Profiles live in `~/.config/VintagestoryData-<name>`. Creating one is just
@@ -96,6 +100,54 @@ earlier run on the system .NET. Install a user-local runtime with:
 curl -sSL https://dot.net/v1/dotnet-install.sh | bash -s -- \
   --runtime dotnet --channel 10.0 --install-dir ~/.dotnet
 ```
+
+## Staying up to date
+
+```
+$ vs-profile update singleplayer
+game:  1.22.7 is the newest stable release and is installed
+mods:  1 update(s) for game 1.22.7, 9 already current
+       bettererprospecting  3.4.3 -> 3.4.5  (tagged up to 1.22.6, you run 1.22.7)
+       bettererprospecting -> 3.4.5  (bettererprospecting_3.4.5.zip)
+```
+
+`update` reads each `.zip` in the profile's `Mods` folder, looks its `modid` up
+on the [mod database](https://mods.vintagestory.at/), and replaces it with the
+newest release that fits the game version *that profile* launches on. Add
+`--dry-run` to see the plan without downloading anything.
+
+Which game version that is matters, and it is the reason this is per-profile
+rather than one global "update my mods": a profile pinned to 1.22.2 for a server
+gets mods for 1.22.2, while an unpinned one gets mods for your newest install.
+Updating a profile never moves its pin.
+
+Mod authors stop re-tagging a release long before it stops working, so an update
+tagged for an earlier patch of the same minor version is still offered, with a
+note saying which way the tag misses — a mod that was last tagged for 1.22.6
+while you run 1.22.7 is a different risk from one built against a patch newer
+than the version this profile is pinned to. Releases from another minor version
+are never offered, and a release candidate is only offered when the mod has no
+stable release newer than yours.
+
+The replaced `.zip` goes to `.vs-profile-oldmods/` inside the profile, one
+generation deep, so a bad update is a `mv` away from being undone and a synced
+profile does not slowly fill up with every mod version it has ever had.
+
+Every update also checks the release index at `api.vintagestory.at` for a newer
+game version. Downloading a 600 MB client is not something to do behind your
+back, so it is only reported unless you ask for it:
+
+```sh
+vs-profile update singleplayer --game   # install the new client too, then the mods
+vs-profile install                      # just install the newest client
+vs-profile install 1.22.5               # or a specific one
+```
+
+`install` verifies the MD5 the index publishes, flattens the tarball's nested
+`vintagestory/` directory into `~/games/vintagestory-<version>`, and adds the
+`DOTNET_ROOT` export that 1.22+ needs to the shipped `run.sh`. If you keep a
+`~/games/vintagestory` symlink pointing at your newest install, it follows —
+but one is never created for you.
 
 ## Cloud sync
 
